@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "karakuri-world": {
+      "url": "{{mcp_endpoint}}",
+      "headers": {
+        "Authorization": "Bearer {{api_key}}"
+      }
+    }
+  }
+}
