@@ -15,37 +15,48 @@ usage() {
 Usage: karakuri.sh <command> [arguments]
 
 Commands:
-  move <target_node_id>                          Move to a target node
-  get_perception                                 Print refreshed perception inline; follow-up choices via Discord
-  get_available_actions                          Print available actions inline; follow-up choices via Discord
-  action <action_id> [duration_minutes]          Execute an action
-  use_item <item_id>                             Use an item from inventory
-  wait <duration>                                Wait (1-6, in 10-minute units)
-  transfer <target_agent_id> --item <item_id> [--quantity <n>]
-  transfer <target_agent_id> --money <amount>
+  get_notification <notification_id>             Open saved notification detail once; starts response timeout without Discord follow-up
+  command <notification_id> <command> <params-json>
+                                                Execute one notification.choices command via generic endpoint
+  move <notification_id> <target_node_id>        Move to a target node
+  get_perception <notification_id>               Print refreshed perception inline; follow-up choices via Discord
+  get_available_actions <notification_id>        Print available actions inline; follow-up choices via Discord
+  action <notification_id> <action_id> [duration_minutes]
+                                                Execute an action
+  use_item <notification_id> <item_id>           Use an item from inventory
+  wait <notification_id> <duration>              Wait (1-6, in 10-minute units)
+  transfer <notification_id> <target_agent_id> --item <item_id> [--quantity <n>]
+  transfer <notification_id> <target_agent_id> --money <amount>
                                                 Start a transfer of one item (default quantity 1) or money to a nearby agent
-  transfer_accept                                Accept the pending transfer offer (resolved from agent state)
-  transfer_reject                                Reject the pending transfer offer (resolved from agent state)
-  conversation_start <target_agent_id> <message> Start a conversation
-  conversation_accept <message>                  Accept a conversation and reply
-  conversation_reject                            Reject a conversation
-  conversation_join <conversation_id>            Join an active conversation on the next turn boundary
-  conversation_stay                              Stay after an inactive-check prompt
-  conversation_leave [message]                   Leave after an inactive-check prompt
-  conversation_speak <next_speaker_agent_id> <message...>
+  transfer_accept <notification_id>              Accept the pending transfer offer (resolved from agent state)
+  transfer_reject <notification_id>              Reject the pending transfer offer (resolved from agent state)
+  conversation_start <notification_id> <target_agent_id> <message>
+                                                Start a conversation
+  conversation_accept <notification_id> <message>
+                                                Accept a conversation and reply
+  conversation_reject <notification_id>          Reject a conversation
+  conversation_join <notification_id> <conversation_id>
+                                                Join an active conversation on the next turn boundary
+  conversation_stay <notification_id>            Stay after an inactive-check prompt
+  conversation_leave <notification_id> [message] Leave after an inactive-check prompt
+  conversation_speak <notification_id> <next_speaker_agent_id> <message...>
       [--item <item_id> [--quantity <n>] | --money <amount> | --accept | --reject]
                                                 Speak in a conversation. Trailing flags optionally
                                                 attach a transfer (item or money) or transfer_response.
-  conversation_end <next_speaker_agent_id> <message...> [--accept | --reject]
+  conversation_end <notification_id> <next_speaker_agent_id> <message...> [--accept | --reject]
                                                 End/leave a conversation. Trailing --accept/--reject
                                                 resolves a pending transfer offer; new transfers
                                                 cannot be opened from end.
-  get_map                                        Print the full map inline; follow-up choices via Discord
-  get_world_agents                               Print all agent states inline; follow-up choices via Discord
-  get_status                                     Print own status inline; follow-up choices via Discord
-  get_nearby_agents                              Print nearby agents inline; follow-up choices via Discord
-  get_active_conversations                       Print joinable active conversations inline; follow-up choices via Discord
-  get_event                                      Print active persistent server events inline; follow-up choices via Discord
+  get_map <notification_id>                      Print the full map inline; follow-up choices via Discord
+  get_world_agents <notification_id>             Print all agent states inline; follow-up choices via Discord
+  get_status <notification_id>                   Print own status inline; follow-up choices via Discord
+  get_nearby_agents <notification_id>            Print nearby agents inline; follow-up choices via Discord
+  get_active_conversations <notification_id>     Print joinable active conversations inline; follow-up choices via Discord
+  get_event <notification_id>                    Print active persistent server events inline; follow-up choices via Discord
+
+get_notification opens the saved notification JSON for a Discord notification_id and does not create an immediate Discord follow-up. It is safe to retry; response timeout starts only on the first fetch.
+
+Every command except get_notification requires the same notification_id that was already fetched with get_notification. Prefer the generic "command" wrapper: merge choices[].params with your filled required_params into params-json, then execute at most one command for the notification. Specific convenience wrappers call the same generic endpoint.
 
 Info/read-style commands (get_perception/get_available_actions/get_map/get_world_agents/get_status/get_nearby_agents/get_active_conversations/get_event)
 print the HTTP response inline as command + data; only follow-up choices arrive via Discord.
@@ -83,6 +94,18 @@ require_positive_int() {
     echo "Error: $1 must be a positive integer (got: $2)." >&2
     exit 1
   fi
+}
+
+
+require_notification_id() {
+  if [ $# -lt 1 ] || [ -z "$1" ]; then
+    echo "Error: notification_id is required." >&2
+    exit 1
+  fi
+}
+
+add_notification_id() {
+  jq -c --arg notification_id "$1" '. + {notification_id: $notification_id}'
 }
 
 json_obj() {
@@ -129,13 +152,29 @@ do_get() {
   do_request -H "${AUTH_HEADER}" "${BASE_URL}$1"
 }
 
+urlencode() {
+  jq -nr --arg value "$1" '$value | @uri'
+}
+
 do_info_get() {
-  do_get "$1"
+  do_get "$1?notification_id=$(urlencode "$2")"
 }
 
 do_post() {
   require_agent_api_key
   do_request -X POST -H "${AUTH_HEADER}" -H "Content-Type: application/json" -d "$2" "${BASE_URL}$1"
+}
+
+do_agent_command() {
+  require_notification_id "$1"
+  local notification_id="$1"
+  local command_name="$2"
+  local params_json="$3"
+  do_post "/agents/command" "$(jq -nc --arg notification_id "$notification_id" --arg command "$command_name" --argjson params "$params_json" '{notification_id: $notification_id, command: $command, params: $params}')"
+}
+
+do_info_command() {
+  do_agent_command "$1" "$2" '{}'
 }
 
 build_conversation_payload() {
@@ -250,35 +289,58 @@ command="$1"
 shift
 
 case "${command}" in
+  get_notification)
+    [ $# -eq 1 ] || { echo "Usage: karakuri.sh get_notification <notification_id>" >&2; exit 1; }
+    [ -n "$1" ] || { echo "Usage: karakuri.sh get_notification <notification_id>" >&2; exit 1; }
+    do_get "/agents/notifications/$1"
+    ;;
+  command)
+    [ $# -eq 3 ] || { echo "Usage: karakuri.sh command <notification_id> <command> <params-json>" >&2; exit 1; }
+    require_notification_id "$1"
+    if ! echo "$3" | jq -e 'type == "object"' >/dev/null; then
+      echo "Error: params-json must be a JSON object." >&2
+      exit 1
+    fi
+    do_agent_command "$1" "$2" "$3"
+    ;;
   move)
-    [ $# -lt 1 ] && { echo "Usage: karakuri.sh move <target_node_id>" >&2; exit 1; }
-    do_post "/agents/move" "$(json_obj target_node_id "$1")"
+    [ $# -eq 2 ] || { echo "Usage: karakuri.sh move <notification_id> <target_node_id>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_agent_command "$1" move "$(json_obj target_node_id "$2")"
     ;;
   get_perception)
-    do_info_get "/agents/perception"
+    [ $# -eq 1 ] || { echo "Usage: karakuri.sh get_perception <notification_id>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_info_command "$1" get_perception
     ;;
   get_available_actions)
-    do_info_get "/agents/available-actions"
+    [ $# -eq 1 ] || { echo "Usage: karakuri.sh get_available_actions <notification_id>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_info_command "$1" get_available_actions
     ;;
   action)
-    [ $# -lt 1 ] && { echo "Usage: karakuri.sh action <action_id> [duration_minutes]" >&2; exit 1; }
-    if [ $# -ge 2 ]; then
-      require_positive_int "duration_minutes" "$2"
-      do_post "/agents/action" "$(jq -nc --arg action_id "$1" --argjson duration_minutes "$2" '{action_id: $action_id, duration_minutes: $duration_minutes}')"
+    [ $# -ge 2 ] || { echo "Usage: karakuri.sh action <notification_id> <action_id> [duration_minutes]" >&2; exit 1; }
+    require_notification_id "$1"
+    if [ $# -ge 3 ]; then
+      require_positive_int "duration_minutes" "$3"
+      do_agent_command "$1" action "$(jq -nc --arg action_id "$2" --argjson duration_minutes "$3" '{action_id: $action_id, duration_minutes: $duration_minutes}')"
     else
-      do_post "/agents/action" "$(json_obj action_id "$1")"
+      do_agent_command "$1" action "$(json_obj action_id "$2")"
     fi
     ;;
   use_item)
-    [ $# -lt 1 ] && { echo "Usage: karakuri.sh use_item <item_id>" >&2; exit 1; }
-    do_post "/agents/use-item" "$(json_obj item_id "$1")"
+    [ $# -eq 2 ] || { echo "Usage: karakuri.sh use_item <notification_id> <item_id>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_agent_command "$1" use_item "$(json_obj item_id "$2")"
     ;;
   transfer)
-    transfer_usage='Usage: karakuri.sh transfer <target_agent_id> --item <item_id> [--quantity <n>]
-       karakuri.sh transfer <target_agent_id> --money <amount>'
-    [ $# -lt 1 ] && { printf '%s\n' "$transfer_usage" >&2; exit 1; }
-    transfer_target="$1"
-    shift
+    transfer_usage='Usage: karakuri.sh transfer <notification_id> <target_agent_id> --item <item_id> [--quantity <n>]
+       karakuri.sh transfer <notification_id> <target_agent_id> --money <amount>'
+    [ $# -ge 2 ] || { printf '%s\n' "$transfer_usage" >&2; exit 1; }
+    require_notification_id "$1"
+    transfer_notification_id="$1"
+    transfer_target="$2"
+    shift 2
     transfer_item_id=""
     transfer_quantity="1"
     transfer_money=""
@@ -327,78 +389,105 @@ case "${command}" in
         --argjson money "$transfer_money" \
         '{target_agent_id: $target_agent_id, money: $money}')"
     fi
-    do_post "/agents/transfer" "$transfer_payload"
+    do_agent_command "$transfer_notification_id" transfer "$transfer_payload"
     ;;
   transfer_accept)
-    # body 不要。pending_transfer_id から自動解決される。
-    do_post "/agents/transfer/accept" '{}'
+    [ $# -eq 1 ] || { echo "Usage: karakuri.sh transfer_accept <notification_id>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_agent_command "$1" transfer_accept '{}'
     ;;
   transfer_reject)
-    # body 不要。pending_transfer_id から自動解決される。
-    do_post "/agents/transfer/reject" '{}'
+    [ $# -eq 1 ] || { echo "Usage: karakuri.sh transfer_reject <notification_id>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_agent_command "$1" transfer_reject '{}'
     ;;
   wait)
-    [ $# -lt 1 ] && { echo "Usage: karakuri.sh wait <duration>" >&2; exit 1; }
-    require_positive_int "duration" "$1"
-    do_post "/agents/wait" "$(jq -nc --argjson duration "$1" '{duration: $duration}')"
+    [ $# -eq 2 ] || { echo "Usage: karakuri.sh wait <notification_id> <duration>" >&2; exit 1; }
+    require_notification_id "$1"
+    require_positive_int "duration" "$2"
+    do_agent_command "$1" wait "$(jq -nc --argjson duration "$2" '{duration: $duration}')"
     ;;
   conversation_start)
-    [ $# -lt 2 ] && { echo "Usage: karakuri.sh conversation_start <target_agent_id> <message>" >&2; exit 1; }
-    do_post "/agents/conversation/start" "$(json_obj target_agent_id "$1" message "${*:2}")"
+    [ $# -ge 3 ] || { echo "Usage: karakuri.sh conversation_start <notification_id> <target_agent_id> <message>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_agent_command "$1" conversation_start "$(json_obj target_agent_id "$2" message "${*:3}")"
     ;;
   conversation_accept)
-    [ $# -lt 1 ] && { echo "Usage: karakuri.sh conversation_accept <message>" >&2; exit 1; }
-    do_post "/agents/conversation/accept" "$(json_obj message "${*:1}")"
+    [ $# -ge 2 ] || { echo "Usage: karakuri.sh conversation_accept <notification_id> <message>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_agent_command "$1" conversation_accept "$(json_obj message "${*:2}")"
     ;;
   conversation_reject)
-    do_post "/agents/conversation/reject" '{}'
+    [ $# -eq 1 ] || { echo "Usage: karakuri.sh conversation_reject <notification_id>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_agent_command "$1" conversation_reject '{}'
     ;;
   conversation_join)
-    [ $# -lt 1 ] && { echo "Usage: karakuri.sh conversation_join <conversation_id>" >&2; exit 1; }
-    do_post "/agents/conversation/join" "$(json_obj conversation_id "$1")"
+    [ $# -eq 2 ] || { echo "Usage: karakuri.sh conversation_join <notification_id> <conversation_id>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_agent_command "$1" conversation_join "$(json_obj conversation_id "$2")"
     ;;
   conversation_stay)
-    do_post "/agents/conversation/stay" '{}'
+    [ $# -eq 1 ] || { echo "Usage: karakuri.sh conversation_stay <notification_id>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_agent_command "$1" conversation_stay '{}'
     ;;
   conversation_leave)
-    if [ $# -ge 1 ]; then
-      do_post "/agents/conversation/leave" "$(json_obj message "${*:1}")"
+    [ $# -ge 1 ] || { echo "Usage: karakuri.sh conversation_leave <notification_id> [message]" >&2; exit 1; }
+    require_notification_id "$1"
+    if [ $# -ge 2 ]; then
+      do_agent_command "$1" conversation_leave "$(json_obj message "${*:2}")"
     else
-      do_post "/agents/conversation/leave" '{}'
+      do_agent_command "$1" conversation_leave '{}'
     fi
     ;;
   conversation_speak)
-    [ $# -lt 2 ] && { echo "Usage: karakuri.sh conversation_speak <next_speaker_agent_id> <message> [--item <id> [--quantity <n>] | --money <amount> | --accept | --reject]" >&2; exit 1; }
+    [ $# -ge 3 ] || { echo "Usage: karakuri.sh conversation_speak <notification_id> <next_speaker_agent_id> <message> [--item <id> [--quantity <n>] | --money <amount> | --accept | --reject]" >&2; exit 1; }
+    require_notification_id "$1"
+    speak_notification_id="$1"
+    shift
     speak_payload="$(build_conversation_payload "speak" "$@")"
-    do_post "/agents/conversation/speak" "$speak_payload"
+    do_agent_command "$speak_notification_id" conversation_speak "$speak_payload"
     ;;
   conversation_end)
-    [ $# -lt 2 ] && { echo "Usage: karakuri.sh conversation_end <next_speaker_agent_id> <message> [--accept | --reject]" >&2; exit 1; }
+    [ $# -ge 3 ] || { echo "Usage: karakuri.sh conversation_end <notification_id> <next_speaker_agent_id> <message> [--accept | --reject]" >&2; exit 1; }
+    require_notification_id "$1"
+    end_notification_id="$1"
+    shift
     end_payload="$(build_conversation_payload "end" "$@")"
-    do_post "/agents/conversation/end" "$end_payload"
+    do_agent_command "$end_notification_id" conversation_end "$end_payload"
     ;;
   get_map)
-    do_info_get "/agents/map"
+    [ $# -eq 1 ] || { echo "Usage: karakuri.sh get_map <notification_id>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_info_command "$1" get_map
     ;;
   get_world_agents)
-    do_info_get "/agents/world-agents"
+    [ $# -eq 1 ] || { echo "Usage: karakuri.sh get_world_agents <notification_id>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_info_command "$1" get_world_agents
     ;;
   get_status)
-    do_info_get "/agents/status"
+    [ $# -eq 1 ] || { echo "Usage: karakuri.sh get_status <notification_id>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_info_command "$1" get_status
     ;;
   get_nearby_agents)
-    do_info_get "/agents/nearby-agents"
+    [ $# -eq 1 ] || { echo "Usage: karakuri.sh get_nearby_agents <notification_id>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_info_command "$1" get_nearby_agents
     ;;
   get_active_conversations)
-    do_info_get "/agents/active-conversations"
+    [ $# -eq 1 ] || { echo "Usage: karakuri.sh get_active_conversations <notification_id>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_info_command "$1" get_active_conversations
     ;;
   get_event)
-    if [ $# -gt 0 ]; then
-      echo "Error: '${command}' takes no arguments. Persistent server events are managed via Discord slash commands or /api/admin/server-events*." >&2
-      exit 1
-    fi
-    do_info_get "/agents/event"
+    [ $# -eq 1 ] || { echo "Usage: karakuri.sh get_event <notification_id>" >&2; exit 1; }
+    require_notification_id "$1"
+    do_info_command "$1" get_event
     ;;
+
   *)
     echo "Error: Unknown command '${command}'" >&2
     usage >&2
